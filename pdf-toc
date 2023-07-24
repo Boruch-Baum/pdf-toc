@@ -1,0 +1,305 @@
+#!/bin/bash
+# pdf-toc - Add table of contents entries to a PDF file
+this="$(basename ${0})"
+
+# DEPENDENCIES: pdftk
+# LICENSE: GPLv3
+# COPYRIGHT: 2023, Boruch Baum <boruch_baum@gmx.com>
+# WEBSITE: https://www.github.com/Boruch_Baum/pdf-toc
+
+# Usage
+usage="Usage: ${this} batch PDF-FILE [dump|update] [TOC-FILE]
+       ${this} add PDF-FILE [dump] [update] page N [level N] DESCRIPTION
+       ${this} [dump|update] PDF-FILE [METADATA-FILE]
+       ${this} --help-long"
+
+# Discussion:
+help="
+This script provides three methods to assist the process of creating
+and editing true table of contents entries in PDF files.
+
+1) Use the 'batch dump' command to output a PDF file's current table
+of contents entries, if any, in an easy-to-edit format TOC-FILE. Then
+edit the TOC-FILE and use the 'batch update' command to install your
+changes. The TOC-FILE format (one line per entry) is: PAGE-NUMBER
+LEVEL-NUMBER DESCRIPTION. The fields are space-delimited and DESCRIPTION
+need not be quoted. TOC-FILE defaults to the pdf filename, but with a
+'.batch' extension.
+
+2) Use the 'add' command to have the script add a single TOC entry.
+Some features of the 'add' command:
+
+ * The addition is placed in its page position, after other entries
+   that might exist for the same page.
+
+ * DESCRIPTION should be quoted if it contains spaces, etc.
+
+ * The 'level' keyword and number are optional and default to 1.
+
+ * If the command finds a text file in the current directory with the
+   same basename as PDF_FILE, it will assume that file is the metadata
+   file, and will perform its edit on that file. For large PDF files,
+   this will save a lot of processing time. You can force the script
+   to perform a new data dump, which will overwrite the current text
+   file, by specifying the optional parameter 'dump'.
+
+ * By default, the command only edits the metadata text file, but does
+   not update the PDF file. For large PDF files, this can save a lot
+   of processing time if you are performing multiple additions. You
+   can specify the optional 'update' parameter to have the script also
+   update the PDF file after performing an individual edit.
+
+ * The script doesn't care in what sequence you specify parameters
+   'dump', 'update', 'page N', 'level N', or 'DESCRIPTION'.
+
+3) Use the 'dump' command to generate a text file of the complete PDF
+metadata. Then edit the file and use the 'update' command to alter the
+PDF file itself. METADATA-FILE defaults to the pdf filename, but with
+a '.txt' extension. The format of a table of contents entry in that
+file is:
+
+    BookmarkBegin
+    BookmarkTitle: YOUR_TITLE
+    BookmarkLevel: INTEGER
+    BookmarkPageNumber: INTEGER
+
+Yes, the nomenclature is confusing. Complain to the committee who
+decided on it, decades ago.
+
+License: GPLv3: Use at your own risk."
+
+awk_to_insert_entry ()
+{
+  mv -f "${meta_file}" "${meta_file}.bak"
+  < "${meta_file}.bak" \
+  > "${meta_file}" \
+  awk -v insert_text="${insert_text}" \
+      -v insert_page="${page}" '
+  /^BookmarkBegin$/{
+    print saved_stanza
+    saved_stanza=$0"\n"
+    getline
+    if ($1 == "BookmarkTitle:") saved_stanza=saved_stanza$0"\n"
+    getline
+    if ($1 == "BookmarkLevel:") saved_stanza=saved_stanza$0"\n"
+    getline
+    if ($1 == "BookmarkPageNumber:" && $2 > insert_page) {
+      print insert_text
+      insert_text=""
+      }
+    print saved_stanza $0
+    saved_stanza=""
+    next
+    }
+  !/^BookmarkBegin$/{print $0}
+  '
+}
+
+awk_validate_batch ()
+{
+  < "${toc_file}" \
+  awk '
+    NF==0 {next}
+    NF<3 { print "Error: Line "NR" has only "NF" fields"; status="bad"; next }
+    $1 !~ /^[0-9]+$/ { print "Error: Line "NR" has a non-integer page number"; status="bad" }
+    $2 !~ /^[0-9]+$/ { print "Error: Line "NR" has a non-integer level number"; status="bad" }
+    END {if (status == "bad") {exit 111} }'
+  [ $? -eq 111 ] \
+  && { printf "${this}: Error(s) encountered in TOC metadata\n" ; exit 1; }
+}
+
+awk_to_merge_batch ()
+{
+  mv -f "${meta_file}" "${meta_file}.bak"
+# < "${toc_file}" < "${meta_file}.bak" \
+  > "${meta_file}" \
+  awk '
+    FNR==NR { if (NF != 0) batch[NR]=$0; next }
+    $1 ~ "Bookmark" { next }
+    { print $0 }
+    $1 == "NumberOfPages:"{
+      for ( i in batch ){
+        $0=batch[i]; page=$1; level=$2; $1=""; $2=""; $0=$0
+        print "BookmarkBegin\nBookmarkTitle: "$0"\nBookmarkLevel: "level"\nBookmarkPageNumber: "page"\n"
+        }
+      }' "${toc_file}" "${meta_file}.bak"
+}
+
+awk_create_batch ()
+{
+  < "${meta_file}" \
+  > "${toc_file}" \
+  awk '
+    function report_error (linenum, field){
+      status="bad"
+      print "Unexpected data in metadata file, line "linenum". Expected "field
+      next
+      }
+    /BookmarkBegin/{
+      title=""; level=""; page=""
+      getline
+      if ($1 == "BookmarkTitle:"){ $1=""; title=$0 }
+      else report_error(NR,"title")
+      getline
+      if ($1 == "BookmarkLevel:"){
+        if ($2 ~ /^[0-9]+$/) level=$2
+        else report_error(NR,"integer")
+        }
+      else report_error(NR,"level")
+      getline
+      if ($1 == "BookmarkPageNumber:"){
+        if ($2 ~ /^[0-9]+$/) page=$2
+        else report_error(NR,"integer")
+        }
+      else report_error(NR,"page")
+      print page" "level" "title
+      }
+    END {if (status == "bad") {exit 111} }'
+  [ $? -eq 111 ] \
+  && { printf "${this}: Error(s) encountered in TOC metadata\n" ; exit 1; }
+}
+
+
+#######################  Main begins here
+
+if ! which pdftk &>/dev/null ; then
+  printf "${this}: Requires package 'pdftk' to be installed\n"
+  exit 1
+fi
+case "${1}" in
+-h|--help|help|--usage|usage)
+  printf "${usage}\n"
+  exit
+  ;;
+--help-long)
+  printf "${usage}\n${help}\n" | less
+  exit
+  ;;
+esac
+if [ $# -lt 2 ] ; then
+  printf "${usage}\n"
+  exit 1
+fi
+if [ ! -r "${2}" ] ; then
+  printf "${this}: File ${2} not readable\n"
+  exit 1
+fi
+if ! [[ "$(file -bi "$2")" =~ "pdf" ]] ; then
+  printf "${this}: File ${2} not recognized as a pdf\n"
+  exit 1
+fi
+
+case "${1}" in
+dump)
+  if [ $# -eq 3 ] ; then
+    meta_file="${3}"
+  else meta_file="${2/%pdf/txt}"
+  fi
+  pdftk "${2}" dump_data_utf8 > "${meta_file}"
+  ;;
+update)
+  mv -f "${2}" "${2}.bak"
+  if [ $# -eq 3 ] ; then
+    meta_file="${3}"
+  else meta_file="${2/%pdf/txt}"
+  fi
+  pdftk "${2}.bak" update_info_utf8 "${meta_file}" output "${2}"
+  ;;
+add)
+  pdf_file="${2}"
+  level=1
+  shift; shift
+  while [ -n "${1}" ] ; do
+    case "${1}" in
+    page)
+      shift
+      if ! [[ "${1}" =~ ^[0-9]+$ ]] ; then
+        printf "${this}: non-integer page number\n"
+        exit 1
+     fi
+      page="${1}"
+      shift
+      ;;
+    level)
+      shift
+      if ! [[ "${1}" =~ ^[0-9]+$ ]] ; then
+        printf "${this}: non-integer level number\n"
+        exit 1
+      fi
+      level="${1}"
+      shift
+      ;;
+    dump)
+      shift
+      dump="true"
+      ;;
+    update)
+      shift
+      update="true"
+      ;;
+    *)
+      if [ -n "${description}" ] ; then
+        printf "${this}: multiple description fields detected\n"
+        exit 1
+      fi
+      description="${1}"
+      shift
+      ;;
+    esac
+  done
+  if [ -z "${page}" ] ; then
+    printf "${this}: missing required field: page number\n"
+    exit 1
+  fi
+  meta_file="${pdf_file/%pdf/txt}"
+  if [ -n "${dump}" ] || ! [ -r "${meta_file}" ] ; then
+    pdftk "${pdf_file}" dump_data_utf8 > "${meta_file}"
+  fi
+  insert_text="BookmarkBegin\nBookmarkTitle: ${description}\nBookmarkLevel: ${level}\nBookmarkPageNumber: ${page}\n\n"
+  awk_to_insert_entry
+  if [ -n "${update}" ] ; then
+    mv -f "${pdf_file}" "${pdf_file}.bak"
+    pdftk "${pdf_file}.bak" update_info_utf8 "${meta_file}" output "${pdf_file}"
+  fi
+  ;;
+batch)
+  pdf_file="${2}"
+  meta_file="${pdf_file/%pdf/txt}"
+  if [ -n "${4}" ] ; then
+    toc_file="${4}"
+  else
+    toc_file="${pdf_file/%pdf/batch}"
+  fi
+  case "${3}" in
+  dump)
+    printf "${this}: (1/2): Getting PDF metadata\n"
+    eval "${0}" dump "${pdf_file}"
+    printf "${this}: (1/2): Creating TOC metadata file\n"
+    awk_create_batch
+    printf "${this}: Completed. See \'${toc_file}\'\n"
+    ;;
+  update)
+    if [ ! -r "${toc_file}" ] ; then
+      printf "${this}: File ${4} not readable\n"
+      exit 1
+    fi
+    printf "${this}: (1/4): Validating your TOC metadata\n"
+    awk_validate_batch
+    printf "${this}: (2/4): Getting PDF metadata\n"
+    eval "${0}" dump "${pdf_file}"
+    printf "${this}: (3/4): Merging your TOC metadata\n"
+    awk_to_merge_batch
+    printf "${this}: (4/4): Updating PDF\n"
+    eval "${0}" update "${pdf_file}"
+    printf "${this}: Completed\n"
+    ;;
+  *)
+    printf "${usage}\n"
+    exit 1
+    ;;
+  esac
+  ;;
+*)
+  printf "${usage}\n"
+  ;;
+esac
